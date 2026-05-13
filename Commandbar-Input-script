@@ -1,0 +1,1372 @@
+-- Cursor Survive V4.2
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local StarterPlayer = game:GetService("StarterPlayer")
+local Workspace = game:GetService("Workspace")
+
+-- cleanup
+for _,svc in ipairs({ReplicatedStorage, StarterPlayer.StarterPlayerScripts, Workspace}) do
+	for _,n in ipairs({"CursorGameV42_Remotes","CursorGameV42_Server","CursorGameV42_Client","CursorGameV42_World"}) do
+		local old = svc:FindFirstChild(n)
+		if old then old:Destroy() end
+	end
+end
+
+-- remotes
+local rem = Instance.new("Folder")
+rem.Name = "CursorGameV42_Remotes"
+rem.Parent = ReplicatedStorage
+
+local function mk(name)
+	local r = Instance.new("RemoteEvent")
+	r.Name = name
+	r.Parent = rem
+	return r
+end
+
+mk("StartGame"); mk("Restart"); mk("Pause"); mk("RequestSetup")
+mk("InputMove"); mk("InputLook"); mk("InputShoot")
+mk("BuyAbility"); mk("TrashAbility")
+mk("HUD"); mk("Wave"); mk("Damage"); mk("GameOver"); mk("Palette"); mk("SFX"); mk("ShopState")
+
+-- server
+local server = Instance.new("Script")
+server.Name = "CursorGameV42_Server"
+server.Parent = Workspace
+server.Source = [[
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local Debris = game:GetService("Debris")
+local TweenService = game:GetService("TweenService")
+
+local rem = ReplicatedStorage:WaitForChild("CursorGameV42_Remotes")
+local RE_StartGame   = rem:WaitForChild("StartGame")
+local RE_Restart     = rem:WaitForChild("Restart")
+local RE_Pause       = rem:WaitForChild("Pause")
+local RE_RequestSetup= rem:WaitForChild("RequestSetup")
+local RE_InputMove   = rem:WaitForChild("InputMove")
+local RE_InputLook   = rem:WaitForChild("InputLook")
+local RE_InputShoot  = rem:WaitForChild("InputShoot")
+local RE_BuyAbility  = rem:WaitForChild("BuyAbility")
+local RE_TrashAbility= rem:WaitForChild("TrashAbility")
+local RE_HUD         = rem:WaitForChild("HUD")
+local RE_Wave        = rem:WaitForChild("Wave")
+local RE_Damage      = rem:WaitForChild("Damage")
+local RE_GameOver    = rem:WaitForChild("GameOver")
+local RE_Palette     = rem:WaitForChild("Palette")
+local RE_SFX         = rem:WaitForChild("SFX")
+local RE_ShopState   = rem:WaitForChild("ShopState")
+
+-- world
+local world = workspace:FindFirstChild("CursorGameV42_World")
+if world then world:Destroy() end
+world = Instance.new("Folder")
+world.Name = "CursorGameV42_World"
+world.Parent = workspace
+
+local map = Instance.new("Folder", world); map.Name = "Map"
+local floor = Instance.new("Part")
+floor.Name = "Floor"
+floor.Anchored = true
+floor.CanCollide = true
+floor.Size = Vector3.new(300,1,190)
+floor.Position = Vector3.new(0,0,0)
+floor.Material = Enum.Material.SmoothPlastic
+floor.Parent = map
+
+local patternFolder = Instance.new("Folder", map); patternFolder.Name = "Pattern"
+local obstacleFolder= Instance.new("Folder", map); obstacleFolder.Name = "Obstacles"
+local borderFolder  = Instance.new("Folder", map); borderFolder.Name = "Borders"
+
+local function mkBorder(size,pos)
+	local p = Instance.new("Part")
+	p.Anchored = true
+	p.CanCollide = true
+	p.Size = size
+	p.Position = pos
+	p.Material = Enum.Material.SmoothPlastic
+	p.Parent = borderFolder
+	return p
+end
+mkBorder(Vector3.new(300,14,3), Vector3.new(0,7,96.5))
+mkBorder(Vector3.new(300,14,3), Vector3.new(0,7,-96.5))
+mkBorder(Vector3.new(3,14,190), Vector3.new(151.5,7,0))
+mkBorder(Vector3.new(3,14,190), Vector3.new(-151.5,7,0))
+
+local entities = Instance.new("Folder", world); entities.Name = "Entities"
+local enemiesFolder = Instance.new("Folder", entities); enemiesFolder.Name = "Enemies"
+local bulletsFolder = Instance.new("Folder", entities); bulletsFolder.Name = "Bullets"
+local ledsFolder    = Instance.new("Folder", entities); ledsFolder.Name = "LEDs"
+local fxFolder      = Instance.new("Folder", entities); fxFolder.Name = "FX"
+
+local ARENA_X, ARENA_Z = 147, 92
+local OBSTACLES = {}
+
+local function clampArena(v)
+	return Vector3.new(math.clamp(v.X,-ARENA_X,ARENA_X), v.Y, math.clamp(v.Z,-ARENA_Z,ARENA_Z))
+end
+local function clearFolder(f) for _,c in ipairs(f:GetChildren()) do c:Destroy() end end
+local function clearRound() clearFolder(enemiesFolder); clearFolder(bulletsFolder); clearFolder(ledsFolder); clearFolder(fxFolder) end
+
+local function pointInObstacleXZ(x,z,pad)
+	pad = pad or 1.6
+	for _,ob in ipairs(OBSTACLES) do
+		if ob and ob.Parent then
+			local sx = ob.Size.X*0.5 + pad
+			local sz = ob.Size.Z*0.5 + pad
+			if x > ob.Position.X-sx and x < ob.Position.X+sx and z > ob.Position.Z-sz and z < ob.Position.Z+sz then
+				return true
+			end
+		end
+	end
+	return false
+end
+
+local P = {}
+local function S(plr)
+	if not P[plr] then
+		P[plr] = {
+			started=false,paused=false,alive=true,hp=100,maxHp=100,leds=0,wave=0,
+			move=Vector2.new(0,0),lookPos=Vector3.new(0,1,0),shootCD=0,invuln=0,hrp=nil,cursor=nil,running=false,
+			ability="None"
+		}
+	end
+	return P[plr]
+end
+
+local ABILITIES = {
+	["Twin Shot"] = {price=40},
+	["Boom Pop"] = {price=85},
+	["Boomerang"] = {price=120},
+	["Laser Tap"] = {price=175},
+	["Mini Sprinkler"] = {price=240},
+}
+local function syncShop(plr)
+	local st = S(plr)
+	RE_ShopState:FireClient(plr, st.ability, st.leds, ABILITIES)
+end
+
+local function regenPattern()
+	clearFolder(patternFolder)
+	local size = 20
+	for x=-140,140,size do
+		for z=-80,80,size do
+			if ((x/size + z/size) % 2)==0 then
+				local t = Instance.new("Part")
+				t.Anchored = true
+				t.CanCollide = false
+				t.Size = Vector3.new(size,0.25,size)
+				t.Position = Vector3.new(x,0.62,z)
+				t.Material = Enum.Material.Neon
+				t.Transparency = 0.32
+				t.Parent = patternFolder
+			end
+		end
+	end
+end
+
+local function regenObstacles(wave)
+	clearFolder(obstacleFolder)
+	OBSTACLES = {}
+	local count = math.min(6 + wave, 24)
+	local tries, placed = 0,0
+	while placed < count and tries < count*25 do
+		tries += 1
+		local sx, sz = math.random(8,16), math.random(8,16)
+		local x, z = math.random(-120,120), math.random(-70,70)
+		if (Vector3.new(x,0,z)-Vector3.new(0,0,0)).Magnitude > 25 then
+			local overlap = false
+			for _,o in ipairs(OBSTACLES) do
+				local dx = math.abs(x-o.Position.X)
+				local dz = math.abs(z-o.Position.Z)
+				if dx < (sx+o.Size.X)/2+4 and dz < (sz+o.Size.Z)/2+4 then overlap=true break end
+			end
+			if not overlap then
+				local o = Instance.new("Part")
+				o.Name = "Obstacle"
+				o.Anchored = true
+				o.CanCollide = true
+				o.Size = Vector3.new(sx, math.random(4,8), sz)
+				o.Position = Vector3.new(x,o.Size.Y/2,z)
+				o.Material = Enum.Material.SmoothPlastic
+				o.Parent = obstacleFolder
+
+				local top = Instance.new("Part")
+				top.Anchored = true
+				top.CanCollide = false
+				top.Size = Vector3.new(sx*0.95,0.3,sz*0.95)
+				top.Position = Vector3.new(x,o.Size.Y+0.15,z)
+				top.Material = Enum.Material.Neon
+				top.Transparency = 0.15
+				top.Parent = obstacleFolder
+
+				table.insert(OBSTACLES, o)
+				placed += 1
+			end
+		end
+	end
+end
+
+local function applyPalette(wave)
+	local palettes = {
+		{Color3.fromRGB(25,85,170), Color3.fromRGB(90,190,255), Color3.fromRGB(12,35,80), Color3.fromRGB(255,170,60)},
+		{Color3.fromRGB(110,30,95), Color3.fromRGB(255,95,195), Color3.fromRGB(50,10,45), Color3.fromRGB(100,250,210)},
+		{Color3.fromRGB(30,120,70), Color3.fromRGB(100,255,150), Color3.fromRGB(15,60,35), Color3.fromRGB(255,220,80)},
+		{Color3.fromRGB(100,50,20), Color3.fromRGB(255,150,75), Color3.fromRGB(48,22,8), Color3.fromRGB(90,210,255)},
+		{Color3.fromRGB(20,95,100), Color3.fromRGB(90,240,255), Color3.fromRGB(10,45,55), Color3.fromRGB(255,105,125)},
+		{Color3.fromRGB(85,25,120), Color3.fromRGB(185,95,255), Color3.fromRGB(40,12,65), Color3.fromRGB(95,255,140)},
+	}
+	local p = palettes[((wave-1)%#palettes)+1]
+	local cf, cp, cb, co = p[1],p[2],p[3],p[4]
+	floor.Color = cf
+	for _,b in ipairs(borderFolder:GetChildren()) do if b:IsA("BasePart") then b.Color = cb end end
+	for _,t in ipairs(patternFolder:GetChildren()) do if t:IsA("BasePart") then t.Color = cp end end
+	for _,o in ipairs(obstacleFolder:GetChildren()) do if o:IsA("BasePart") then o.Color = co end end
+	for _,plr in ipairs(Players:GetPlayers()) do
+		RE_Palette:FireClient(plr, cf,cp,cb,co,wave)
+	end
+end
+
+local function setupCharacter(plr)
+	local st = S(plr)
+	local char = plr.Character
+	if not char then return end
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	local hrp = char:FindFirstChild("HumanoidRootPart")
+	if not hum or not hrp then return end
+
+	hum.WalkSpeed = 0
+	hum.JumpPower = 0
+	hum.AutoRotate = false
+	hum.PlatformStand = false
+	for _,state in ipairs({Enum.HumanoidStateType.Jumping,Enum.HumanoidStateType.Freefall,Enum.HumanoidStateType.Swimming,Enum.HumanoidStateType.Climbing}) do
+		hum:SetStateEnabled(state,false)
+	end
+
+	for _,d in ipairs(char:GetDescendants()) do
+		if d:IsA("BasePart") then d.Transparency=1 d.CanCollide=false
+		elseif d:IsA("Decal") then d.Transparency=1 end
+	end
+
+	hrp.Anchored = true
+	hrp.CanCollide = false
+	hrp.CFrame = CFrame.new(0,3,0)
+
+	local old = char:FindFirstChild("CursorModel")
+	if old then old:Destroy() end
+
+	local m = Instance.new("Model")
+	m.Name = "CursorModel"
+	m.Parent = char
+
+	-- TRUE TOP-DOWN TRIANGLE (Rotated by 90 degrees on Z to show flat top-down instead of a rectangle)
+	local tri = Instance.new("Part")
+	tri.Name = "TriangleCursor"
+	tri.Size = Vector3.new(1.8,0.3,1.8)
+	tri.Material = Enum.Material.Neon
+	tri.Color = Color3.fromRGB(225,240,255)
+	tri.Anchored = false
+	tri.CanCollide = false
+	tri.CFrame = hrp.CFrame * CFrame.new(0,1.15,0) * CFrame.Angles(0, 0, math.rad(90))
+	tri.Parent = m
+
+	local mesh = Instance.new("SpecialMesh")
+	mesh.MeshType = Enum.MeshType.Wedge
+	mesh.Scale = Vector3.new(1.15,0.7,1.35)
+	mesh.Parent = tri
+
+	local weld = Instance.new("WeldConstraint")
+	weld.Part0 = tri
+	weld.Part1 = hrp
+	weld.Parent = tri
+
+	local light = Instance.new("PointLight")
+	light.Brightness = 1.4
+	light.Range = 12
+	light.Color = tri.Color
+	light.Parent = tri
+
+	st.hrp = hrp
+	st.cursor = tri
+	st.lookPos = hrp.Position + Vector3.new(0,0,1)
+end
+
+local function enemiesForWave(w)
+	if w==1 then return 3 end
+	if w==2 then return 5 end
+	if w==3 then return 7 end
+	local tier = math.floor((w-1)/3)
+	return 7 + tier*3 + (w%3)
+end
+local function enemyHP(w) return 60 + (w-1)*12 end
+local function enemySpeed(w) return math.min(18, 4 + w*0.65) end
+
+local function boom(pos,color)
+	for i=1,16 do
+		local p = Instance.new("Part")
+		p.Size = Vector3.new(0.25,0.25,0.25)
+		p.Material = Enum.Material.Neon
+		p.Color = color
+		p.Anchored = false
+		p.CanCollide = false
+		p.Position = pos + Vector3.new(0,0.5,0)
+		p.Parent = fxFolder
+		local bv = Instance.new("BodyVelocity")
+		bv.MaxForce = Vector3.new(1e6,1e6,1e6)
+		bv.Velocity = Vector3.new(math.random(-55,55),math.random(14,46),math.random(-55,55))
+		bv.Parent = p
+		Debris:AddItem(bv,0.14); Debris:AddItem(p,0.8)
+	end
+end
+
+local function rainbow() return Color3.fromHSV(math.random(),1,1) end
+
+local function spawnLED(pos)
+	local led = Instance.new("Part")
+	led.Name = "LED"
+	led.Anchored = true
+	led.CanCollide = false
+	led.Size = Vector3.new(0.95,0.95,0.95)
+	led.Position = pos + Vector3.new(math.random(-2,2),1.0,math.random(-2,2))
+	led.Material = Enum.Material.Neon
+	led.Color = rainbow()
+	led.Parent = ledsFolder
+
+	local mesh = Instance.new("SpecialMesh")
+	mesh.MeshType = Enum.MeshType.FileMesh
+	mesh.MeshId = "rbxassetid://9756362"
+	mesh.Scale = Vector3.new(0.72,0.92,0.72)
+	mesh.Parent = led
+
+	local light = Instance.new("PointLight")
+	light.Brightness = 1.5
+	light.Range = 10
+	light.Color = led.Color
+	light.Parent = led
+
+	local born = tick()
+	local life = 8
+	local spin = math.random(-260,260)
+
+	local con
+	con = RunService.Heartbeat:Connect(function(dt)
+		if not led.Parent then con:Disconnect() return end
+		led.CFrame = led.CFrame * CFrame.Angles(0, math.rad(spin*dt), 0)
+
+		local nearest, nd = nil, 9999
+		for _,plr in ipairs(Players:GetPlayers()) do
+			local st = S(plr)
+			if st.started and st.alive and not st.paused and st.hrp then
+				local d = (st.hrp.Position - led.Position).Magnitude
+				if d < nd then nd=d nearest=plr end
+			end
+		end
+
+		if nearest then
+			local st = S(nearest)
+			local hrp = st.hrp
+			if hrp then
+				if nd <= 22 then
+					local dir = hrp.Position - led.Position
+					if dir.Magnitude > 0.01 then led.Position += dir.Unit * (36*dt) end
+				end
+				if (hrp.Position - led.Position).Magnitude <= 4.0 then
+					st.leds += 1
+					RE_HUD:FireClient(nearest, "LEDS", st.leds)
+					RE_SFX:FireClient(nearest, "Collect")
+					led:Destroy()
+					return
+				end
+			end
+		end
+
+		if tick()-born >= life then
+			local tw = TweenService:Create(led, TweenInfo.new(0.45), {Transparency=1, Size=Vector3.new(0.12,0.12,0.12)})
+			tw:Play(); tw.Completed:Wait()
+			if led then led:Destroy() end
+		end
+	end)
+end
+
+local function damagePlayer(plr, amt)
+	local st = S(plr)
+	if not st.started or st.paused or not st.alive then return end
+	if tick() < st.invuln then return end
+	st.invuln = tick() + 0.6
+	st.hp = math.max(0, st.hp - amt)
+	RE_Damage:FireClient(plr, st.hp, st.maxHp)
+	RE_SFX:FireClient(plr, "Hit")
+	if st.hp <= 0 then
+		st.alive = false
+		st.started = false
+		RE_GameOver:FireClient(plr, st.wave, st.leds)
+		clearRound()
+	end
+end
+
+local PERSONALITIES = {
+	{name="Noodle", mode="Direct"},
+	{name="Pickle", mode="Orbit"},
+	{name="Mochi",  mode="Zigzag"},
+	{name="Toast",  mode="Dash"},
+}
+
+local function spawnEnemy(wave)
+	local side = (math.random()<0.5) and -1 or 1
+	local e = Instance.new("Part")
+	e.Name = "Enemy"
+	e.Anchored = true
+	e.CanCollide = false
+	e.Size = Vector3.new(2.2,2.2,2.2)
+	e.Material = Enum.Material.Neon
+	e.Color = Color3.fromRGB(255,70,70)
+	e.Position = Vector3.new(side*140,1.2,math.random(-80,80))
+	e.Parent = enemiesFolder
+
+	local hp = Instance.new("IntValue", e); hp.Name="HP"; hp.Value = enemyHP(wave)
+	local p = PERSONALITIES[math.random(1,#PERSONALITIES)]
+	local q = Instance.new("StringValue", e); q.Name="Quirk"; q.Value = p.name
+
+	local spd = enemySpeed(wave)
+	local seed = math.random()*1000
+	local dashTimer = 0
+
+	local con
+	con = RunService.Heartbeat:Connect(function(dt)
+		if not e.Parent then con:Disconnect() return end
+		local target, tpos, dist = nil,nil,99999
+		for _,plr in ipairs(Players:GetPlayers()) do
+			local st = S(plr)
+			if st.started and st.alive and not st.paused and st.hrp then
+				local d = (st.hrp.Position - e.Position).Magnitude
+				if d < dist then dist=d target=plr tpos=st.hrp.Position end
+			end
+		end
+		if not tpos then return end
+
+		local dir = (tpos - e.Position)
+		local move = Vector3.new(0,0,0)
+		if dir.Magnitude > 0.01 then
+			local u = dir.Unit
+			if p.mode=="Direct" then move = u * spd * dt
+			elseif p.mode=="Orbit" then
+				local perp = Vector3.new(-u.Z,0,u.X)
+				move = (perp*0.7 + u*0.65).Unit * (spd*0.95) * dt
+			elseif p.mode=="Zigzag" then
+				local perp = Vector3.new(-u.Z,0,u.X)
+				local wobble = math.sin(tick()*4 + seed) * 0.8
+				move = (u*0.8 + perp*wobble).Unit * (spd*1.03) * dt
+			elseif p.mode=="Dash" then
+				dashTimer += dt
+				if dashTimer > 1.3 then move = u * (spd*2.4) * dt dashTimer = 0
+				else move = u * (spd*0.45) * dt end
+			end
+		end
+
+		local nx, nz = e.Position.X + move.X, e.Position.Z + move.Z
+		if not pointInObstacleXZ(nx,nz,1.6) then
+			e.Position = Vector3.new(nx,e.Position.Y,nz)
+		else
+			if not pointInObstacleXZ(nx,e.Position.Z,1.6) then e.Position = Vector3.new(nx,e.Position.Y,e.Position.Z)
+			elseif not pointInObstacleXZ(e.Position.X,nz,1.6) then e.Position = Vector3.new(e.Position.X,e.Position.Y,nz) end
+		end
+		e.Position = clampArena(e.Position)
+
+		if target then
+			local st = S(target)
+			if st.hrp and (st.hrp.Position - e.Position).Magnitude <= 2.7 then damagePlayer(target,14) end
+		end
+
+		if hp.Value <= 0 then
+			boom(e.Position, e.Color)
+			for i=1,math.random(1,5) do spawnLED(e.Position) end
+			e:Destroy()
+			con:Disconnect()
+		end
+	end)
+end
+
+local function bulletHitCheck(b, damage)
+	local bp = b.Position
+	for _,e in ipairs(enemiesFolder:GetChildren()) do
+		local hp = e:FindFirstChild("HP")
+		if hp and (e.Position - bp).Magnitude <= 2.2 then
+			hp.Value -= damage
+			if b and b.Parent then b:Destroy() end
+			return true
+		end
+	end
+	return false
+end
+
+local function spawnLinearBullet(origin, dir, speed, damage, maxDistance)
+	local b = Instance.new("Part")
+	b.Name = "Bullet"
+	b.Anchored = true
+	b.CanCollide = false
+	b.Size = Vector3.new(0.36,0.36,2.2)
+	b.Material = Enum.Material.Neon
+	b.Color = Color3.fromRGB(255,235,90)
+	b.CFrame = CFrame.new(origin, origin + dir)
+	b.Parent = bulletsFolder
+
+	local l = Instance.new("PointLight")
+	l.Brightness = 1.8; l.Range = 10; l.Color = b.Color; l.Parent = b
+
+	local traveled = 0
+	local con
+	con = RunService.Heartbeat:Connect(function(dt)
+		if not b.Parent then con:Disconnect() return end
+		local step = speed*dt
+		b.CFrame += b.CFrame.LookVector * step
+		traveled += step
+
+		if bulletHitCheck(b, damage) then con:Disconnect() return end
+		if traveled >= maxDistance then b:Destroy(); con:Disconnect() end
+	end)
+end
+
+local function spawnBoomBullet(origin, dir, speed, damage, maxDistance)
+	local b = Instance.new("Part")
+	b.Name = "BoomBullet"
+	b.Anchored = true
+	b.CanCollide = false
+	b.Size = Vector3.new(0.44,0.44,2.3)
+	b.Material = Enum.Material.Neon
+	b.Color = Color3.fromRGB(255,180,80)
+	b.CFrame = CFrame.new(origin, origin + dir)
+	b.Parent = bulletsFolder
+
+	local traveled = 0
+	local con
+	con = RunService.Heartbeat:Connect(function(dt)
+		if not b.Parent then con:Disconnect() return end
+		local step = speed*dt
+		b.CFrame += b.CFrame.LookVector * step
+		traveled += step
+
+		local bp = b.Position
+		local hit = false
+		for _,e in ipairs(enemiesFolder:GetChildren()) do
+			local hp = e:FindFirstChild("HP")
+			if hp and (e.Position - bp).Magnitude <= 2.2 then hit=true break end
+		end
+		if hit then
+			for _,e in ipairs(enemiesFolder:GetChildren()) do
+				local hp = e:FindFirstChild("HP")
+				if hp and (e.Position - bp).Magnitude <= 8 then hp.Value -= damage end
+			end
+			for i=1,12 do
+				local p = Instance.new("Part")
+				p.Size = Vector3.new(0.22,0.22,0.22)
+				p.Material = Enum.Material.Neon
+				p.Color = Color3.fromRGB(255,170,90)
+				p.Anchored=false; p.CanCollide=false; p.Position=bp; p.Parent=fxFolder
+				local bv = Instance.new("BodyVelocity", p)
+				bv.MaxForce = Vector3.new(1e6,1e6,1e6)
+				bv.Velocity = Vector3.new(math.random(-45,45),math.random(10,35),math.random(-45,45))
+				Debris:AddItem(bv,0.1); Debris:AddItem(p,0.5)
+			end
+			b:Destroy(); con:Disconnect(); return
+		end
+		if traveled >= maxDistance then b:Destroy(); con:Disconnect() end
+	end)
+end
+
+local function spawnBoomerang(plr, origin, dir, speed, damage, maxDistanceOut)
+	local b = Instance.new("Part")
+	b.Name = "BoomerangBullet"
+	b.Anchored = true
+	b.CanCollide = false
+	b.Size = Vector3.new(0.4,0.4,2.1)
+	b.Material = Enum.Material.Neon
+	b.Color = Color3.fromRGB(170,255,140)
+	b.CFrame = CFrame.new(origin, origin + dir)
+	b.Parent = bulletsFolder
+
+	local traveled = 0
+	local returning = false
+
+	local con
+	con = RunService.Heartbeat:Connect(function(dt)
+		if not b.Parent then con:Disconnect() return end
+		if not returning then
+			local step = speed*dt
+			b.CFrame += b.CFrame.LookVector * step
+			traveled += step
+			if traveled >= maxDistanceOut then returning=true end
+		else
+			local st = S(plr)
+			if st.hrp then
+				local to = st.hrp.Position - b.Position
+				if to.Magnitude > 0.01 then
+					local u = to.Unit
+					b.CFrame = CFrame.new(b.Position, b.Position + u)
+					b.CFrame += b.CFrame.LookVector * speed * 1.05 * dt
+					if to.Magnitude <= 3.2 then b:Destroy(); con:Disconnect(); return end
+				end
+			else
+				b:Destroy(); con:Disconnect(); return
+			end
+		end
+		if bulletHitCheck(b, damage) then con:Disconnect(); return end
+	end)
+end
+
+local function spawnLaserTap(origin, dir, damage)
+	local beam = Instance.new("Part")
+	beam.Name = "Laser"
+	beam.Anchored = true
+	beam.CanCollide = false
+	beam.Size = Vector3.new(0.35,0.35,70)
+	beam.Material = Enum.Material.Neon
+	beam.Color = Color3.fromRGB(255,255,120)
+	beam.CFrame = CFrame.new(origin + dir*35, origin + dir*36)
+	beam.Parent = bulletsFolder
+
+	for _,e in ipairs(enemiesFolder:GetChildren()) do
+		local hp = e:FindFirstChild("HP")
+		if hp then
+			local rel = e.Position - origin
+			local proj = rel:Dot(dir)
+			if proj > 0 and proj < 75 then
+				local closest = origin + dir*proj
+				local dist = (e.Position - closest).Magnitude
+				if dist <= 2.4 then hp.Value -= damage end
+			end
+		end
+	end
+	Debris:AddItem(beam,0.12)
+end
+
+local function fireByAbility(plr)
+	local st = S(plr)
+	if not st.started or st.paused or not st.alive or not st.hrp then return end
+	if tick() < st.shootCD then return end
+
+	-- Flatten the Y axis so the bullet travels completely straight instead of angled toward the ground!
+	local dir = (st.lookPos - st.hrp.Position)
+	dir = Vector3.new(dir.X, 0, dir.Z)
+	if dir.Magnitude < 0.01 then return end
+	dir = dir.Unit
+
+	local origin = st.hrp.Position + st.hrp.CFrame.LookVector*1.8 + Vector3.new(0,1.15,0)
+	local baseDamage = 20
+	local ability = st.ability
+
+	if ability == "None" then
+		st.shootCD = tick() + 0.11
+		spawnLinearBullet(origin, dir, 170, baseDamage, 180)
+	elseif ability == "Twin Shot" then
+		st.shootCD = tick() + 0.12
+		local perp = Vector3.new(-dir.Z,0,dir.X)
+		spawnLinearBullet(origin + perp*0.8, dir, 170, baseDamage, 180)
+		spawnLinearBullet(origin - perp*0.8, dir, 170, baseDamage, 180)
+	elseif ability == "Boom Pop" then
+		st.shootCD = tick() + 0.2
+		spawnBoomBullet(origin, dir, 160, math.floor(baseDamage*1.5), 170)
+	elseif ability == "Boomerang" then
+		st.shootCD = tick() + 0.18
+		spawnBoomerang(plr, origin, dir, 160, math.floor(baseDamage*1.35), 90)
+	elseif ability == "Laser Tap" then
+		st.shootCD = tick() + 0.26
+		spawnLaserTap(origin, dir, math.floor(baseDamage*1.8))
+	elseif ability == "Mini Sprinkler" then
+		st.shootCD = tick() + 0.055
+		local spread = math.rad(math.random(-8,8))
+		local c, s = math.cos(spread), math.sin(spread)
+		local d = Vector3.new(dir.X*c - dir.Z*s, 0, dir.X*s + dir.Z*c).Unit
+		spawnLinearBullet(origin, d, 180, math.floor(baseDamage*0.75), 160)
+	end
+
+	RE_SFX:FireClient(plr, "Shoot")
+end
+
+local function updateMovement(dt, plr, st)
+	if not st.started or st.paused or not st.alive or not st.hrp then return end
+	local m = st.move
+	if m.Magnitude > 1 then m = m.Unit end
+	local speed = 35
+
+	local nx = st.hrp.Position.X + m.X * speed * dt
+	local nz = st.hrp.Position.Z + m.Y * speed * dt
+
+	local cur = st.hrp.Position
+	local pad = 2.0
+	if not pointInObstacleXZ(nx,nz,pad) then
+		cur = Vector3.new(nx,cur.Y,nz)
+	else
+		if not pointInObstacleXZ(nx,cur.Z,pad) then cur = Vector3.new(nx,cur.Y,cur.Z) end
+		if not pointInObstacleXZ(cur.X,nz,pad) then cur = Vector3.new(cur.X,cur.Y,nz) end
+	end
+	cur = clampArena(cur)
+
+	local look = Vector3.new(st.lookPos.X, cur.Y, st.lookPos.Z)
+	if (look-cur).Magnitude > 0.01 then st.hrp.CFrame = CFrame.new(cur, look)
+	else st.hrp.CFrame = CFrame.new(cur) end
+end
+
+local function runWaves(plr)
+	local st = S(plr)
+	if st.running then return end
+	st.running = true
+	task.spawn(function()
+		while plr.Parent and st.started and st.alive do
+			if st.paused then task.wait(0.1) else
+				st.wave += 1
+				regenPattern(); regenObstacles(st.wave); applyPalette(st.wave)
+				RE_Wave:FireClient(plr, st.wave)
+				task.wait(1.15)
+
+				local count = enemiesForWave(st.wave)
+				for i=1,count do
+					if not st.started or not st.alive then break end
+					spawnEnemy(st.wave)
+					task.wait(math.max(0.18, 0.8 - st.wave*0.03))
+				end
+
+				while st.started and st.alive do
+					if st.paused then task.wait(0.1) else
+						local aliveEnemies = 0
+						for _,e in ipairs(enemiesFolder:GetChildren()) do
+							local hp = e:FindFirstChild("HP")
+							if hp and hp.Value > 0 then aliveEnemies += 1 end
+						end
+						if aliveEnemies <= 0 then break end
+						task.wait(0.2)
+					end
+				end
+				task.wait(1.8)
+			end
+		end
+		st.running = false
+	end)
+end
+
+local function resetRun(plr)
+	local st = S(plr)
+	st.started=true; st.paused=false; st.alive=true
+	st.hp=100; st.maxHp=100; st.leds=0; st.wave=0
+	st.move=Vector2.new(0,0); st.shootCD=0; st.invuln=0
+	st.ability="None"
+
+	clearRound()
+	if not (plr.Character and plr.Character.Parent) then plr:LoadCharacter() end
+	task.wait(0.05)
+	setupCharacter(plr)
+	if st.hrp then st.hrp.CFrame = CFrame.new(0,3,0) end
+
+	RE_HUD:FireClient(plr, "LEDS", 0)
+	RE_Damage:FireClient(plr, st.hp, st.maxHp)
+	syncShop(plr)
+	runWaves(plr)
+end
+
+Players.PlayerAdded:Connect(function(plr)
+	S(plr)
+	plr.CharacterAdded:Connect(function()
+		task.wait(0.2)
+		setupCharacter(plr)
+	end)
+end)
+Players.PlayerRemoving:Connect(function(plr) P[plr]=nil end)
+
+RE_RequestSetup.OnServerEvent:Connect(function(plr) setupCharacter(plr) end)
+RE_StartGame.OnServerEvent:Connect(function(plr) resetRun(plr) end)
+RE_Restart.OnServerEvent:Connect(function(plr) resetRun(plr) end)
+RE_Pause.OnServerEvent:Connect(function(plr,val)
+	local st=S(plr)
+	if st.started and st.alive then st.paused = val and true or false end
+end)
+RE_InputMove.OnServerEvent:Connect(function(plr,vec)
+	if typeof(vec)=="Vector2" then S(plr).move = vec end
+end)
+RE_InputLook.OnServerEvent:Connect(function(plr,pos)
+	if typeof(pos)=="Vector3" then S(plr).lookPos = pos end
+end)
+RE_InputShoot.OnServerEvent:Connect(function(plr) fireByAbility(plr) end)
+
+RE_BuyAbility.OnServerEvent:Connect(function(plr,name)
+	local st=S(plr)
+	if not ABILITIES[name] then return end
+	if st.ability ~= "None" then syncShop(plr) return end
+	local price = ABILITIES[name].price
+	if st.leds >= price then
+		st.leds -= price
+		st.ability = name
+		RE_HUD:FireClient(plr, "LEDS", st.leds)
+		syncShop(plr)
+	end
+end)
+RE_TrashAbility.OnServerEvent:Connect(function(plr)
+	local st=S(plr)
+	st.ability="None"
+	syncShop(plr)
+end)
+
+RunService.Heartbeat:Connect(function(dt)
+	for _,plr in ipairs(Players:GetPlayers()) do
+		updateMovement(dt, plr, S(plr))
+	end
+end)
+
+regenPattern(); regenObstacles(1); applyPalette(1)
+]]
+
+-- client
+local client = Instance.new("LocalScript")
+client.Name = "CursorGameV42_Client"
+client.Parent = StarterPlayer.StarterPlayerScripts
+client.Source = [[
+local Players = game:GetService("Players")
+local UIS = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
+local SoundService = game:GetService("SoundService")
+
+local plr = Players.LocalPlayer
+local rem = ReplicatedStorage:WaitForChild("CursorGameV42_Remotes")
+
+local RE_StartGame    = rem:WaitForChild("StartGame")
+local RE_Restart      = rem:WaitForChild("Restart")
+local RE_Pause        = rem:WaitForChild("Pause")
+local RE_RequestSetup = rem:WaitForChild("RequestSetup")
+local RE_InputMove    = rem:WaitForChild("InputMove")
+local RE_InputLook    = rem:WaitForChild("InputLook")
+local RE_InputShoot   = rem:WaitForChild("InputShoot")
+local RE_BuyAbility   = rem:WaitForChild("BuyAbility")
+local RE_TrashAbility = rem:WaitForChild("TrashAbility")
+local RE_HUD          = rem:WaitForChild("HUD")
+local RE_Wave         = rem:WaitForChild("Wave")
+local RE_Damage       = rem:WaitForChild("Damage")
+local RE_GameOver     = rem:WaitForChild("GameOver")
+local RE_Palette      = rem:WaitForChild("Palette")
+local RE_SFX          = rem:WaitForChild("SFX")
+local RE_ShopState    = rem:WaitForChild("ShopState")
+
+local function mkSound(id, vol)
+	local s = Instance.new("Sound")
+	s.SoundId = id
+	s.Volume = vol
+	s.Parent = SoundService
+	return s
+end
+local sShoot = mkSound("rbxassetid://9118823106", 0.18)
+local sHit = mkSound("rbxassetid://9113420770", 0.25)
+local sCollect = mkSound("rbxassetid://9118828563", 0.28)
+
+local pg = plr:WaitForChild("PlayerGui")
+local old = pg:FindFirstChild("CursorGameV42_UI")
+if old then old:Destroy() end
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "CursorGameV42_UI"
+gui.IgnoreGuiInset = true
+gui.ResetOnSpawn = false
+gui.Parent = pg
+
+local bg = Instance.new("Frame")
+bg.Size = UDim2.fromScale(1,1)
+bg.BackgroundColor3 = Color3.fromRGB(10,12,18)
+bg.BorderSizePixel = 0
+bg.Parent = gui
+
+local startLayer = Instance.new("Frame")
+startLayer.Size = UDim2.fromScale(1,1)
+startLayer.BackgroundTransparency = 1
+startLayer.Parent = gui
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.fromScale(1,0.24)
+title.Position = UDim2.fromScale(0,0.18)
+title.BackgroundTransparency = 1
+title.Text = "CURSOR SURVIVE"
+title.Font = Enum.Font.GothamBlack
+title.TextScaled = true
+title.TextColor3 = Color3.fromRGB(235,242,255)
+title.Parent = startLayer
+
+local startBtn = Instance.new("TextButton")
+startBtn.AnchorPoint = Vector2.new(0.5,0.5)
+startBtn.Position = UDim2.fromScale(0.5,0.58)
+startBtn.Size = UDim2.fromScale(0.22,0.11)
+startBtn.BackgroundColor3 = Color3.fromRGB(75,170,255)
+startBtn.Text = "START"
+startBtn.TextScaled = true
+startBtn.Font = Enum.Font.GothamBold
+startBtn.TextColor3 = Color3.new(1,1,1)
+startBtn.Parent = startLayer
+Instance.new("UICorner", startBtn).CornerRadius = UDim.new(0.2,0)
+
+local hud = Instance.new("Frame")
+hud.Size = UDim2.fromScale(1,1)
+hud.BackgroundTransparency = 1
+hud.Visible = false
+hud.Parent = gui
+
+local ledsLabel = Instance.new("TextLabel")
+ledsLabel.AnchorPoint = Vector2.new(1,0)
+ledsLabel.Position = UDim2.fromScale(0.985,0.02)
+ledsLabel.Size = UDim2.fromScale(0.15,0.055)
+ledsLabel.BackgroundColor3 = Color3.fromRGB(20,25,35)
+ledsLabel.BackgroundTransparency = 0.2
+ledsLabel.Text = "LEDS: 0"
+ledsLabel.TextScaled = true
+ledsLabel.Font = Enum.Font.GothamBold
+ledsLabel.TextColor3 = Color3.new(1,1,1)
+ledsLabel.Parent = hud
+Instance.new("UICorner", ledsLabel).CornerRadius = UDim.new(0.24,0)
+
+local hpBack = Instance.new("Frame")
+hpBack.Position = UDim2.fromScale(0.015,0.02)
+hpBack.Size = UDim2.fromScale(0.25,0.04)
+hpBack.BackgroundColor3 = Color3.fromRGB(26,30,40)
+hpBack.Parent = hud
+Instance.new("UICorner", hpBack).CornerRadius = UDim.new(0.22,0)
+
+local hpFill = Instance.new("Frame")
+hpFill.Size = UDim2.fromScale(1,1)
+hpFill.BackgroundColor3 = Color3.fromRGB(255,95,95)
+hpFill.Parent = hpBack
+Instance.new("UICorner", hpFill).CornerRadius = UDim.new(0.22,0)
+
+local hpText = Instance.new("TextLabel")
+hpText.Size = UDim2.fromScale(1,1)
+hpText.BackgroundTransparency = 1
+hpText.Text = "HP 100/100"
+hpText.TextScaled = true
+hpText.Font = Enum.Font.GothamBold
+hpText.TextColor3 = Color3.new(1,1,1)
+hpText.Parent = hpBack
+
+local waveLabel = Instance.new("TextLabel")
+waveLabel.AnchorPoint = Vector2.new(0.5,0.0)
+waveLabel.Position = UDim2.fromScale(0.5,0.06)
+waveLabel.Size = UDim2.fromScale(0.34,0.08)
+waveLabel.BackgroundColor3 = Color3.fromRGB(0,0,0)
+waveLabel.BackgroundTransparency = 0.25
+waveLabel.TextStrokeTransparency = 0
+waveLabel.TextStrokeColor3 = Color3.fromRGB(0,0,0)
+waveLabel.TextColor3 = Color3.fromRGB(255,245,130)
+waveLabel.Font = Enum.Font.GothamBlack
+waveLabel.TextScaled = true
+waveLabel.Text = ""
+waveLabel.Visible = false
+waveLabel.Parent = hud
+Instance.new("UICorner", waveLabel).CornerRadius = UDim.new(0.24,0)
+
+local pauseBtn = Instance.new("TextButton")
+pauseBtn.AnchorPoint = Vector2.new(1,1)
+pauseBtn.Position = UDim2.fromScale(0.985,0.98)
+pauseBtn.Size = UDim2.fromScale(0.12,0.06)
+pauseBtn.BackgroundColor3 = Color3.fromRGB(50,65,90)
+pauseBtn.Text = "PAUSE"
+pauseBtn.TextScaled = true
+pauseBtn.Font = Enum.Font.GothamBold
+pauseBtn.TextColor3 = Color3.new(1,1,1)
+pauseBtn.Parent = hud
+Instance.new("UICorner", pauseBtn).CornerRadius = UDim.new(0.24,0)
+
+local pauseOverlay = Instance.new("Frame")
+pauseOverlay.Size = UDim2.fromScale(1,1)
+pauseOverlay.BackgroundColor3 = Color3.fromRGB(8,10,14)
+pauseOverlay.BackgroundTransparency = 0.32
+pauseOverlay.Visible = false
+pauseOverlay.Parent = gui
+
+local pauseText = Instance.new("TextLabel")
+pauseText.AnchorPoint = Vector2.new(0.5,0.5)
+pauseText.Position = UDim2.fromScale(0.5,0.17)
+pauseText.Size = UDim2.fromScale(0.35,0.1)
+pauseText.BackgroundTransparency = 1
+pauseText.Text = "PAUSED"
+pauseText.TextScaled = true
+pauseText.Font = Enum.Font.GothamBlack
+pauseText.TextColor3 = Color3.fromRGB(240,245,255)
+pauseText.Parent = pauseOverlay
+
+local shopBtn = Instance.new("TextButton")
+shopBtn.AnchorPoint = Vector2.new(0.5,0.5)
+shopBtn.Position = UDim2.fromScale(0.5,0.28)
+shopBtn.Size = UDim2.fromScale(0.18,0.08)
+shopBtn.BackgroundColor3 = Color3.fromRGB(80,170,255)
+shopBtn.Text = "SHOP"
+shopBtn.TextScaled = true
+shopBtn.Font = Enum.Font.GothamBold
+shopBtn.TextColor3 = Color3.new(1,1,1)
+shopBtn.Parent = pauseOverlay
+Instance.new("UICorner", shopBtn).CornerRadius = UDim.new(0.2,0)
+
+local shopPanel = Instance.new("Frame")
+shopPanel.AnchorPoint = Vector2.new(0.5,0.5)
+shopPanel.Position = UDim2.fromScale(0.5,1.4)
+shopPanel.Size = UDim2.fromScale(0.62,0.65)
+shopPanel.BackgroundColor3 = Color3.fromRGB(70,45,30)
+shopPanel.Visible = false
+shopPanel.Parent = pauseOverlay
+Instance.new("UICorner", shopPanel).CornerRadius = UDim.new(0.04,0)
+
+local roof = Instance.new("Frame")
+roof.Size = UDim2.fromScale(1,0.12)
+roof.BackgroundColor3 = Color3.fromRGB(105,65,40)
+roof.Parent = shopPanel
+
+local shopTitle = Instance.new("TextLabel")
+shopTitle.Size = UDim2.fromScale(1,0.12)
+shopTitle.BackgroundTransparency = 1
+shopTitle.Text = "SHACK SHOP"
+shopTitle.TextScaled = true
+shopTitle.Font = Enum.Font.GothamBlack
+shopTitle.TextColor3 = Color3.fromRGB(255,235,190)
+shopTitle.Parent = shopPanel
+
+local currentAbility = Instance.new("TextLabel")
+currentAbility.Position = UDim2.fromScale(0.05,0.14)
+currentAbility.Size = UDim2.fromScale(0.9,0.08)
+currentAbility.BackgroundTransparency = 1
+currentAbility.Text = "Active: None"
+currentAbility.TextScaled = true
+currentAbility.Font = Enum.Font.GothamBold
+currentAbility.TextColor3 = Color3.fromRGB(240,240,255)
+currentAbility.Parent = shopPanel
+
+local trashBtn = Instance.new("TextButton")
+trashBtn.Position = UDim2.fromScale(0.75,0.14)
+trashBtn.Size = UDim2.fromScale(0.2,0.08)
+trashBtn.BackgroundColor3 = Color3.fromRGB(220,80,80)
+trashBtn.Text = "🗑"
+trashBtn.TextScaled = true
+trashBtn.Font = Enum.Font.GothamBlack
+trashBtn.TextColor3 = Color3.new(1,1,1)
+trashBtn.Parent = shopPanel
+Instance.new("UICorner", trashBtn).CornerRadius = UDim.new(0.2,0)
+
+local closeShop = Instance.new("TextButton")
+closeShop.Position = UDim2.fromScale(0.05,0.88)
+closeShop.Size = UDim2.fromScale(0.2,0.08)
+closeShop.BackgroundColor3 = Color3.fromRGB(90,110,140)
+closeShop.Text = "BACK"
+closeShop.TextScaled = true
+closeShop.Font = Enum.Font.GothamBold
+closeShop.TextColor3 = Color3.new(1,1,1)
+closeShop.Parent = shopPanel
+Instance.new("UICorner", closeShop).CornerRadius = UDim.new(0.2,0)
+
+local abilitiesContainer = Instance.new("Frame")
+abilitiesContainer.Position = UDim2.fromScale(0.05,0.26)
+abilitiesContainer.Size = UDim2.fromScale(0.9,0.58)
+abilitiesContainer.BackgroundTransparency = 1
+abilitiesContainer.Parent = shopPanel
+local grid = Instance.new("UIGridLayout")
+grid.CellSize = UDim2.fromScale(0.48,0.18)
+grid.CellPadding = UDim2.fromScale(0.04,0.04)
+grid.Parent = abilitiesContainer
+
+local gameOver = Instance.new("Frame")
+gameOver.Size = UDim2.fromScale(1,1)
+gameOver.BackgroundColor3 = Color3.fromRGB(10,10,14)
+gameOver.BackgroundTransparency = 0.25
+gameOver.Visible = false
+gameOver.Parent = gui
+
+local goTitle = Instance.new("TextLabel")
+goTitle.AnchorPoint = Vector2.new(0.5,0.5)
+goTitle.Position = UDim2.fromScale(0.5,0.38)
+goTitle.Size = UDim2.fromScale(0.7,0.15)
+goTitle.BackgroundTransparency = 1
+goTitle.Text = "GAME OVER"
+goTitle.TextScaled = true
+goTitle.Font = Enum.Font.GothamBlack
+goTitle.TextColor3 = Color3.fromRGB(255,120,120)
+goTitle.Parent = gameOver
+
+local goStats = Instance.new("TextLabel")
+goStats.AnchorPoint = Vector2.new(0.5,0.5)
+goStats.Position = UDim2.fromScale(0.5,0.49)
+goStats.Size = UDim2.fromScale(0.8,0.12)
+goStats.BackgroundTransparency = 1
+goStats.TextScaled = true
+goStats.Font = Enum.Font.GothamBold
+goStats.TextColor3 = Color3.fromRGB(235,240,255)
+goStats.Parent = gameOver
+
+local restartBtn = Instance.new("TextButton")
+restartBtn.AnchorPoint = Vector2.new(0.5,0.5)
+restartBtn.Position = UDim2.fromScale(0.5,0.61)
+restartBtn.Size = UDim2.fromScale(0.22,0.1)
+restartBtn.BackgroundColor3 = Color3.fromRGB(70,180,255)
+restartBtn.Text = "RESTART"
+restartBtn.TextScaled = true
+restartBtn.Font = Enum.Font.GothamBold
+restartBtn.TextColor3 = Color3.new(1,1,1)
+restartBtn.Parent = gameOver
+Instance.new("UICorner", restartBtn).CornerRadius = UDim.new(0.2,0)
+
+local flash = Instance.new("Frame")
+flash.Size = UDim2.fromScale(1,1)
+flash.BackgroundColor3 = Color3.fromRGB(255,90,90)
+flash.BackgroundTransparency = 1
+flash.Parent = gui
+
+local started, paused, alive = false,false,true
+local keyW,keyA,keyS,keyD = false,false,false,false
+local lastMoveSent = Vector2.new(999,999)
+local lastShot = 0
+local shootCD = 0.04
+local shopOpen = false
+local activeAbility = "None"
+local abilityData = {}
+local ledsCount = 0
+local abilityButtons = {}
+
+local function pulse(obj)
+	local o = obj.Size
+	local a = TweenService:Create(obj, TweenInfo.new(0.08), {Size = o + UDim2.fromScale(0.01,0.01)})
+	local b = TweenService:Create(obj, TweenInfo.new(0.08), {Size = o})
+	a:Play(); a.Completed:Wait(); b:Play()
+end
+
+local function getMoveVec()
+	local x,y = 0,0
+    -- Controls explicitly swapped W/S with A/D
+	if keyW then x -= 1 end
+	if keyS then x += 1 end
+	if keyA then y += 1 end
+	if keyD then y -= 1 end
+	local v = Vector2.new(x,y)
+	if v.Magnitude > 1 then v = v.Unit end
+	return v
+end
+
+local function setPaused(v)
+	if not started or not alive then return end
+	paused = v
+	pauseOverlay.Visible = paused
+	pauseBtn.Text = paused and "RESUME" or "PAUSE"
+	RE_Pause:FireServer(paused)
+	if not paused then
+		shopOpen = false
+		shopPanel.Visible = false
+		shopPanel.Position = UDim2.fromScale(0.5,1.4)
+	end
+end
+
+local function refreshShopButtons()
+	for _,btn in ipairs(abilityButtons) do
+		local nm = btn.Name
+		local info = abilityData[nm]
+		if info then
+			btn.Text = nm.."  ("..info.price.." LEDS)"
+			if activeAbility ~= "None" and activeAbility ~= nm then
+				btn.BackgroundColor3 = Color3.fromRGB(80,80,80)
+			else
+				btn.BackgroundColor3 = Color3.fromRGB(90,165,120)
+			end
+		end
+	end
+	currentAbility.Text = "Active: "..activeAbility
+end
+
+local function buildShopButtons()
+	for _,c in ipairs(abilitiesContainer:GetChildren()) do
+		if c:IsA("TextButton") then c:Destroy() end
+	end
+	table.clear(abilityButtons)
+
+	for _,name in ipairs({"Twin Shot","Boom Pop","Boomerang","Laser Tap","Mini Sprinkler"}) do
+		local b = Instance.new("TextButton")
+		b.Name = name
+		b.BackgroundColor3 = Color3.fromRGB(90,165,120)
+		b.TextColor3 = Color3.new(1,1,1)
+		b.TextScaled = true
+		b.Font = Enum.Font.GothamBold
+		b.Text = name
+		b.Parent = abilitiesContainer
+		Instance.new("UICorner", b).CornerRadius = UDim.new(0.18,0)
+		b.MouseButton1Click:Connect(function() RE_BuyAbility:FireServer(name) end)
+		table.insert(abilityButtons,b)
+	end
+	refreshShopButtons()
+end
+
+startBtn.MouseButton1Click:Connect(function()
+	if started then return end
+	started,paused,alive = true,false,true
+	startLayer.Visible=false
+	bg.BackgroundTransparency=1
+	hud.Visible=true
+	gameOver.Visible=false
+	pauseOverlay.Visible=false
+	RE_StartGame:FireServer()
+end)
+
+restartBtn.MouseButton1Click:Connect(function()
+	started,paused,alive = true,false,true
+	hud.Visible=true
+	gameOver.Visible=false
+	pauseOverlay.Visible=false
+	RE_Restart:FireServer()
+end)
+
+pauseBtn.MouseButton1Click:Connect(function() setPaused(not paused) end)
+
+shopBtn.MouseButton1Click:Connect(function()
+	if not paused then return end
+	if not shopOpen then
+		shopOpen=true
+		shopPanel.Visible=true
+		buildShopButtons()
+		TweenService:Create(shopPanel, TweenInfo.new(0.35, Enum.EasingStyle.Quint, Enum.EasingDirection.Out), {
+			Position = UDim2.fromScale(0.5,0.55)
+		}):Play()
+	else
+		shopOpen=false
+		local t=TweenService:Create(shopPanel, TweenInfo.new(0.25, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {
+			Position=UDim2.fromScale(0.5,1.4)
+		})
+		t:Play(); t.Completed:Wait(); shopPanel.Visible=false
+	end
+end)
+
+closeShop.MouseButton1Click:Connect(function()
+	shopOpen=false
+	local t=TweenService:Create(shopPanel, TweenInfo.new(0.25, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {
+		Position=UDim2.fromScale(0.5,1.4)
+	})
+	t:Play(); t.Completed:Wait(); shopPanel.Visible=false
+end)
+
+trashBtn.MouseButton1Click:Connect(function() RE_TrashAbility:FireServer() end)
+
+UIS.InputBegan:Connect(function(inp,gp)
+	if gp then return end
+	if inp.KeyCode==Enum.KeyCode.Escape and started and alive then setPaused(not paused) end
+	if inp.KeyCode==Enum.KeyCode.W then keyW=true end
+	if inp.KeyCode==Enum.KeyCode.A then keyA=true end
+	if inp.KeyCode==Enum.KeyCode.S then keyS=true end
+	if inp.KeyCode==Enum.KeyCode.D then keyD=true end
+
+	if inp.UserInputType == Enum.UserInputType.MouseButton1 then
+		if started and alive and not paused then
+			local now=tick()
+			if now-lastShot>=shootCD then
+				lastShot=now
+				RE_InputShoot:FireServer()
+			end
+		end
+	end
+end)
+
+UIS.InputEnded:Connect(function(inp,gp)
+	if inp.KeyCode==Enum.KeyCode.W then keyW=false end
+	if inp.KeyCode==Enum.KeyCode.A then keyA=false end
+	if inp.KeyCode==Enum.KeyCode.S then keyS=false end
+	if inp.KeyCode==Enum.KeyCode.D then keyD=false end
+end)
+
+plr.CharacterAdded:Connect(function()
+	task.wait(0.2)
+	RE_RequestSetup:FireServer()
+end)
+RE_RequestSetup:FireServer()
+
+RE_HUD.OnClientEvent:Connect(function(kind,v)
+	if kind=="LEDS" then
+		ledsCount=v
+		ledsLabel.Text="LEDS: "..tostring(v)
+		pulse(ledsLabel)
+	end
+end)
+
+RE_Wave.OnClientEvent:Connect(function(w)
+	waveLabel.Visible=true
+	waveLabel.Text="WAVE "..tostring(w)
+	waveLabel.TextTransparency=1
+	waveLabel.BackgroundTransparency=1
+	local i=TweenService:Create(waveLabel, TweenInfo.new(0.2), {TextTransparency=0,BackgroundTransparency=0.25})
+	i:Play()
+	task.delay(1.5,function()
+		if waveLabel then
+			local o=TweenService:Create(waveLabel, TweenInfo.new(0.3), {TextTransparency=1,BackgroundTransparency=1})
+			o:Play(); o.Completed:Wait()
+			waveLabel.Visible=false
+		end
+	end)
+end)
+
+RE_Damage.OnClientEvent:Connect(function(hp,maxHp)
+	local r=(maxHp>0) and (hp/maxHp) or 0
+	hpFill:TweenSize(UDim2.fromScale(math.clamp(r,0,1),1), Enum.EasingDirection.Out, Enum.EasingStyle.Quad, 0.12, true)
+	hpText.Text=("HP %d/%d"):format(hp,maxHp)
+	flash.BackgroundTransparency=0.78
+	TweenService:Create(flash, TweenInfo.new(0.18), {BackgroundTransparency=1}):Play()
+end)
+
+RE_GameOver.OnClientEvent:Connect(function(wave, leds)
+	started,paused,alive=false,false,false
+	hud.Visible=false
+	pauseOverlay.Visible=false
+	gameOver.Visible=true
+	goStats.Text=("You reached Wave %d  |  LEDS: %d"):format(wave,leds)
+end)
+
+RE_Palette.OnClientEvent:Connect(function(cf,cp,cb,co,wave)
+	waveLabel.BackgroundColor3=cb
+	ledsLabel.BackgroundColor3=co
+	pauseBtn.BackgroundColor3=cb
+	startBtn.BackgroundColor3=co
+	title.TextColor3=cp
+end)
+
+RE_SFX.OnClientEvent:Connect(function(kind)
+	if kind=="Shoot" then sShoot:Play()
+	elseif kind=="Hit" then sHit:Play()
+	elseif kind=="Collect" then sCollect:Play()
+	end
+end)
+
+RE_ShopState.OnClientEvent:Connect(function(active, leds, abilities)
+	activeAbility=active
+	abilityData=abilities or {}
+	ledsCount=leds or ledsCount
+	ledsLabel.Text="LEDS: "..tostring(ledsCount)
+	refreshShopButtons()
+end)
+
+RunService.RenderStepped:Connect(function()
+	local cam=Workspace.CurrentCamera
+	if not cam then return end
+	local char=plr.Character
+	local hrp=char and char:FindFirstChild("HumanoidRootPart")
+
+	if started and hrp then
+		local camPos = hrp.Position + Vector3.new(0,72,0)
+		cam.CameraType=Enum.CameraType.Scriptable
+		cam.CFrame=CFrame.new(camPos, hrp.Position + Vector3.new(0,0.1,0))
+		cam.FieldOfView=44
+
+		local mv=getMoveVec()
+		if (mv-lastMoveSent).Magnitude>0.001 then
+			lastMoveSent=mv
+			RE_InputMove:FireServer(mv)
+		end
+
+		if not paused and alive then
+			local m=plr:GetMouse()
+			local ray=cam:ScreenPointToRay(m.X,m.Y)
+			if math.abs(ray.Direction.Y)>0.00001 then
+				local t=(1-ray.Origin.Y)/ray.Direction.Y
+				local hit=ray.Origin + ray.Direction*t
+				RE_InputLook:FireServer(hit)
+			end
+		end
+	else
+		cam.CameraType=Enum.CameraType.Custom
+	end
+end)
+]]
+
+print("✅ Cursor Survive V4.2 installed (Controls inverted, trajectory flattened, wedge rotated true-top-down).")
