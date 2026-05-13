@@ -268,7 +268,7 @@ local function setupCharacter(plr)
 	tri.Color = Color3.fromRGB(225,240,255)
 	tri.Anchored = false
 	tri.CanCollide = false
-	tri.CFrame = hrp.CFrame * CFrame.new(0,1.15,0) * CFrame.Angles(0, 0, math.rad(90))
+	tri.CFrame = hrp.CFrame * CFrame.new(0,1.15,0) * CFrame.Angles(0, math.rad(180), math.rad(90))
 	tri.Parent = m
 
 	local mesh = Instance.new("SpecialMesh")
@@ -1131,11 +1131,10 @@ end
 
 local function getMoveVec()
 	local x,y = 0,0
-    -- Controls explicitly swapped W/S with A/D
-	if keyW then x -= 1 end
-	if keyS then x += 1 end
-	if keyA then y += 1 end
-	if keyD then y -= 1 end
+	if keyA then x -= 1 end
+	if keyD then x += 1 end
+	if keyW then y -= 1 end
+	if keyS then y += 1 end
 	local v = Vector2.new(x,y)
 	if v.Magnitude > 1 then v = v.Unit end
 	return v
